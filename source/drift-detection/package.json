@@ -1,0 +1,16 @@
+{
+  "name": "drift-detection",
+  "version": "1.1.0",
+  "description": "Lambda Package to detect drift on the primary and secondary stacks.",
+  "main": "index.js",
+  "scripts": {
+    "clean": "rm -rf node_modules coverage",
+    "test": "CI=true jest --config jestconfig.json --coverage --silent"
+  },
+  "author": "aws-solutions-builders",
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "aws-sdk": "2.631.0",
+    "jest": "^26.6.3"
+  }
+}
