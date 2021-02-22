@@ -39,7 +39,14 @@ SUB1="s/CODE_BUCKET/$1/g"
 SUB2="s/SOLUTION_NAME/$2/g"
 SUB3="s/SOLUTION_VERSION/$3/g"
 
-for FULLNAME in ./*.yaml
+for FULLNAME in ./multi-region-infrastructure-deployment-github.yaml
+do
+  TEMPLATE=`basename $FULLNAME .yaml`
+  echo "Preparing $TEMPLATE"
+  sed -e $SUB1 -e $SUB2 -e $SUB3 $template_dir/$TEMPLATE.yaml > $template_dist_dir/$TEMPLATE.template
+done
+
+for FULLNAME in ./multi-region-infrastructure-deployment-codecommit.yaml
 do
   TEMPLATE=`basename $FULLNAME .yaml`
   echo "Preparing $TEMPLATE"
