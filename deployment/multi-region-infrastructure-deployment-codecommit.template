@@ -13,7 +13,7 @@
 
 AWSTemplateFormatVersion: 2010-09-09
 
-Description: (SO0086) - The Multi Region Infrastructure Deployment Solution validates and deploys CloudFormation templates to stage and prod environments across AWS Regions (Version SOLUTION_VERSION)
+Description: (SO0086) - The Multi Region Infrastructure Deployment Solution validates and deploys CloudFormation templates to stage and prod environments across AWS Regions (Version v1.1.0)
 
 Parameters:
   NotificationEmailAddress:
@@ -21,13 +21,10 @@ Parameters:
     Description: (Optional) Change and drift detection notification E-mail Address
     AllowedPattern: "^$|^[_A-Za-z0-9-\\+]+(\\.[_A-Za-z0-9-]+)*@[A-Za-z0-9-]+(\\.[A-Za-z0-9]+)*(\\.[A-Za-z]{2,})$"
 
-  SolutionSecretName:
+  CodeCommitRepositoryName:
     Type: String
-    Description: AWS Secrets Manager name
-  GitHubRepo:
-    Type: String
-    Description: GitHub repository name
-  GitHubBranch:
+    Description: CodeCommit repository name
+  CodeCommitBranchName:
     Type: String
     Description: e.g., mainline
 
@@ -41,7 +38,7 @@ Parameters:
 
   CloudFormationExecutionPolicy:
     Type: String
-    Description: The ARN of the IAM Policy used to allow CloudFormation to create/execute change sets. Create an IAM Policy specific to administering the resources that will be provisioned by the CloudFormation Template in the GitHub repository.
+    Description: The ARN of the IAM Policy used to allow CloudFormation to create/execute change sets. Create an IAM Policy specific to administering the resources that will be provisioned by the CloudFormation Template in the CodeCommit repository.
 
   StageParameters:
     Type: String
@@ -74,11 +71,10 @@ Metadata:
         Parameters:
           - NotificationEmailAddress
       - Label:
-          default: GitHub Repository Configuration
+          default: CodeCommit Repository Configuration
         Parameters:
-          - SolutionSecretName
-          - GitHubRepo
-          - GitHubBranch
+          - CodeCommitRepositoryName
+          - CodeCommitBranchName
           - TemplatePath
       - Label:
           default: Application Stack Parameters
@@ -95,11 +91,9 @@ Metadata:
     ParameterLabels:
       NotificationEmailAddress:
         default: E-Mail to notify changes to approve and drift detection
-      SolutionSecretName:
-        default: Name of the AWS Secrets Manager secret that stores the GitHub Username and Personal Access Token to access the repository
-      GitHubRepo:
-        default: Name of the GitHub repository that should trigger the pipeline
-      GitHubBranch:
+      CodeCommitRepositoryName:
+        default: Name of the CodeCommit repository that should trigger the pipeline
+      CodeCommitBranchName:
         default: Name of the branch in the above repository that should trigger the pipeline
       TemplatePath:
         default: Path to the CloudFormation template in the above repository
@@ -126,8 +120,8 @@ Conditions:
 Mappings:
   SourceCode:
     General:
-      S3Bucket: CODE_BUCKET
-      KeyPrefix: SOLUTION_NAME/SOLUTION_VERSION
+      S3Bucket: solutions
+      KeyPrefix: multi-region-infrastructure-deployment/v1.1.0
   Solution:
     Metrics:
       SendAnonymousData: Yes
@@ -232,6 +226,14 @@ Resources:
                 Resource:
                   - !Sub arn:aws:s3:::${PrimaryArtifactStore}/*
                   - !Sub arn:aws:s3:::${SecondaryBucketCreator.BucketName}/*
+              - Effect: Allow
+                Action:
+                  - 'codecommit:CancelUploadArchive'
+                  - 'codecommit:GetBranch'
+                  - 'codecommit:GetCommit'
+                  - 'codecommit:GetUploadArchiveStatus'
+                  - 'codecommit:UploadArchive'
+                Resource: '*'
               - Effect: Allow
                 Action:
                   - codebuild:StartBuild
@@ -350,20 +352,18 @@ Resources:
       Stages:
         - Name: Source
           Actions:
-            - Name: GitHub
+            - Name: SourceAction
               ActionTypeId:
                 Category: Source
-                Owner: ThirdParty
+                Owner: AWS
                 Version: '1'
-                Provider: GitHub
-              Configuration:
-                Owner: !Sub '{{resolve:secretsmanager:${SolutionSecretName}:SecretString:github-username}}'
-                Repo: !Ref GitHubRepo
-                Branch: !Ref GitHubBranch
-                OAuthToken: !Sub '{{resolve:secretsmanager:${SolutionSecretName}:SecretString:github-access-token}}'
-                PollForSourceChanges: false
+                Provider: CodeCommit
               OutputArtifacts:
                 - Name: Source
+              Configuration:
+                BranchName: !Ref CodeCommitBranchName
+                RepositoryName: !Ref CodeCommitRepositoryName   
+                PollForSourceChanges: false
         - !If
           - DeletingStage
           - Name: !Sub InitializeStage-${AWS::Region}
@@ -601,20 +601,6 @@ Resources:
               RunOrder: 1
               Region: !Ref AWS::Region
 
-  InfraPipelineWebhook:
-    Type: AWS::CodePipeline::Webhook
-    Properties:
-      Authentication: GITHUB_HMAC
-      AuthenticationConfiguration:
-        SecretToken: !Sub '{{resolve:secretsmanager:${SolutionSecretName}:SecretString:github-access-token}}'
-      Filters:
-        - JsonPath: "$.ref"
-          MatchEquals: refs/heads/{Branch}
-      TargetPipeline: !Ref InfraPipeline
-      TargetAction: GitHub
-      Name: !Sub ${AWS::StackName}-AppPipelineWebhook
-      TargetPipelineVersion: !GetAtt InfraPipeline.Version
-      RegisterWithThirdParty: true
 
   CfnNagBuildProject:
     Type: AWS::CodeBuild::Project
@@ -819,7 +805,7 @@ Resources:
           REGION: !Ref AWS::Region
           SOLUTION_ID: SO0086
           UUID: !GetAtt UuidGenerator.Value
-          VERSION: SOLUTION_VERSION
+          VERSION: v1.1.0
           ARTIFACT_SOURCE: !Join ["", ["/", !Ref "AWS::StackName", "/", !FindInMap ["StageArtifact", "Parameter", "Source"]]]
           DELETE_STAGE_STACK: !Ref DeleteStageStack
           SEND_METRICS: !FindInMap ["Solution" ,"Metrics" ,"SendAnonymousData"]
@@ -1221,5 +1207,5 @@ Resources:
       ServiceToken: !GetAtt CustomResourceLambda.Arn
       SOLUTION_ID: SO0086
       UUID: !GetAtt UuidGenerator.Value
-      VERSION: SOLUTION_VERSION
+      VERSION: v1.1.0
       SEND_METRICS: !FindInMap ["Solution" ,"Metrics" ,"SendAnonymousData"]
