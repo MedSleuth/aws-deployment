@@ -69,7 +69,8 @@ aws s3 sync ./global-s3-assets/ s3://$DIST_OUTPUT_BUCKET-$REGION/$SOLUTION_NAME/
 ```
 
 ### 5. Launch the CloudFormation template.
-* Get the link of the multi-region-infrastructure-deployment.template uploaded to your Amazon S3 bucket.
+* Two templates will be uploaded to your S3 Bucket, one with github tag and the other with codecommit tag.
+* Get the link of the multi-region-infrastructure-deployment.template uploaded to your Amazon S3 bucket based on your source choice (i.e. GitHub or CodeCommit).
 * Deploy the Multi Region Infrastructure Deployment Solution to your account by launching a new AWS CloudFormation stack using the S3 link of the multi-region-infrastructure-deployment.template.
 
 ## File Structure
