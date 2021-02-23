@@ -16,17 +16,35 @@ AWSTemplateFormatVersion: 2010-09-09
 Description: (SO0086) - The Multi Region Infrastructure Deployment Solution validates and deploys CloudFormation templates to stage and prod environments across AWS Regions (Version v1.1.0)
 
 Parameters:
+  SourceStage:
+    Type: String
+    Description: Source Stage for CodePipeline
+    AllowedValues:
+      - GitHub
+      - CodeCommit
+   
   NotificationEmailAddress:
     Type: String
     Description: (Optional) Change and drift detection notification E-mail Address
     AllowedPattern: "^$|^[_A-Za-z0-9-\\+]+(\\.[_A-Za-z0-9-]+)*@[A-Za-z0-9-]+(\\.[A-Za-z0-9]+)*(\\.[A-Za-z]{2,})$"
 
-  CodeCommitRepositoryName:
+  SolutionSecretName:
     Type: String
-    Description: CodeCommit repository name
+    Description: AWS Secrets Manager name
+
+  CodeCommitRepoName:
+    Type: String
+    Description: CodeCommit repository name. Leave this field blank if you are using GitHub as a source stage.
   CodeCommitBranchName:
     Type: String
-    Description: e.g., mainline
+    Description: e.g., mainline. Leave this field blank if you are using GitHub as a source stage.
+
+  GitHubRepo:
+    Type: String
+    Description: CodeCommit repository name. Leave this field blank if you are using CodeCommit as a source stage.
+  GitHubBranch:
+    Type: String
+    Description: e.g., mainline. Leave this field blank if you are using CodeCommit as a source stage.
 
   SecondaryRegion:
     Type: String
@@ -71,9 +89,20 @@ Metadata:
         Parameters:
           - NotificationEmailAddress
       - Label:
+          default: SourceStage
+        Parameters:
+          - SourceStage
+      - Label:
+          default: GitHub Repository Configuration
+        Parameters:
+          - SolutionSecretName
+          - GitHubRepo
+          - GitHubBranch
+          - TemplatePath
+      - Label:
           default: CodeCommit Repository Configuration
         Parameters:
-          - CodeCommitRepositoryName
+          - CodeCommitRepoName
           - CodeCommitBranchName
           - TemplatePath
       - Label:
@@ -91,7 +120,15 @@ Metadata:
     ParameterLabels:
       NotificationEmailAddress:
         default: E-Mail to notify changes to approve and drift detection
-      CodeCommitRepositoryName:
+      SourceStage:
+        default: The Source Stage which the pipeline will be based on
+      SolutionSecretName:
+        default: Name of the AWS Secrets Manager secret that stores the GitHub Username and Personal Access Token to access the repository
+      GitHubRepo:
+        default: Name of the GitHub repository that should trigger the pipeline
+      GitHubBranch:
+        default: Name of the branch in the above repository that should trigger the pipeline
+      CodeCommitRepoName:
         default: Name of the CodeCommit repository that should trigger the pipeline
       CodeCommitBranchName:
         default: Name of the branch in the above repository that should trigger the pipeline
@@ -116,6 +153,12 @@ Conditions:
   HasSecondaryParameters: !Not [ !Equals [ !Ref SecondaryParameters, '' ] ]
   HasPrimaryParameters: !Not [ !Equals [ !Ref PrimaryParameters, '' ] ]
   DeletingStage: !Equals [ !Ref DeleteStageStack, 'Yes' ]
+  UseGitHub: !Equals 
+    - !Ref SourceStage
+    - GitHub
+  UseCodeCommit: !Equals 
+    - !Ref SourceStage
+    - CodeCommit
 
 Mappings:
   SourceCode:
@@ -336,8 +379,9 @@ Resources:
       Endpoint: !Ref NotificationEmailAddress
       Protocol: email
 
-  InfraPipeline:
+  InfraCodeCommitPipeline:
     Type: AWS::CodePipeline::Pipeline
+    Condition: UseCodeCommit
     Properties:
       ArtifactStores:
         - Region: !Ref AWS::Region
@@ -362,7 +406,7 @@ Resources:
                 - Name: Source
               Configuration:
                 BranchName: !Ref CodeCommitBranchName
-                RepositoryName: !Ref CodeCommitRepositoryName   
+                RepositoryName: !Ref CodeCommitRepoName   
                 PollForSourceChanges: false
         - !If
           - DeletingStage
@@ -601,6 +645,290 @@ Resources:
               RunOrder: 1
               Region: !Ref AWS::Region
 
+
+  InfraGitHubPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Condition: UseGitHub
+    Properties:
+      ArtifactStores:
+        - Region: !Ref AWS::Region
+          ArtifactStore:
+            Type: S3
+            Location: !Ref PrimaryArtifactStore
+        - Region: !Ref SecondaryRegion
+          ArtifactStore:
+            Type: S3
+            Location: !GetAtt SecondaryBucketCreator.BucketName
+      RoleArn: !GetAtt InfraPipelineRole.Arn
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHub
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Version: '1'
+                Provider: GitHub
+              Configuration:
+                Owner: !Sub '{{resolve:secretsmanager:${SolutionSecretName}:SecretString:github-username}}'
+                Repo: !Ref GitHubRepo
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Sub '{{resolve:secretsmanager:${SolutionSecretName}:SecretString:github-access-token}}'
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: Source
+        - !If
+          - DeletingStage
+          - Name: !Sub InitializeStage-${AWS::Region}
+            Actions:
+              - Name: CreateStageArtifact
+                ActionTypeId:
+                  Category: Invoke
+                  Owner: AWS
+                  Provider: Lambda
+                  Version: '1'
+                Configuration:
+                  FunctionName: !Ref CreateStageArtifactLambda
+                InputArtifacts:
+                  - Name: Source
+                OutputArtifacts:
+                  - Name: StageArtifact-Source
+                  - Name: StageArtifact-Parameter
+                RunOrder: 1
+                Region: !Ref AWS::Region
+
+              - Name: Deploy
+                ActionTypeId:
+                  Category: Deploy
+                  Owner: AWS
+                  Provider: CloudFormation
+                  Version: '1'
+                Configuration:
+                  ActionMode: CREATE_UPDATE
+                  RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+                  StackName: !Sub ${AWS::StackName}-Stack-Stage-${AWS::Region}
+                  TemplatePath: !Sub StageArtifact-Source::${TemplatePath}
+                  TemplateConfiguration: StageArtifact-Parameter::parameters.json
+                  Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                InputArtifacts:
+                  - Name: StageArtifact-Source
+                  - Name: StageArtifact-Parameter
+                RunOrder: 2
+                Region: !Ref AWS::Region
+          - !Ref AWS::NoValue
+
+        - Name: CheckChanges
+          Actions:
+            - Name: CreateChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+                StackName: !Sub ${AWS::StackName}-Stack-Stage-${AWS::Region}
+                ChangeSetName: !FindInMap ["StageArtifact", "Name", "ChangeSet"]
+                TemplatePath: !Sub Source::${TemplatePath}
+                Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                ParameterOverrides: !If [ HasStageParameters, !Ref StageParameters, !Ref "AWS::NoValue" ]
+              InputArtifacts:
+                - Name: Source
+              OutputArtifacts:
+                - Name: !FindInMap ["StageArtifact", "Name", "ChangeSet"]
+              RunOrder: 1
+              Region: !Ref AWS::Region
+
+            - Name: CheckChangeSetForChanges
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: '1'
+              Configuration:
+                FunctionName: !Ref ChangeSetValidatorLambda
+              InputArtifacts:
+                - Name: !FindInMap ["StageArtifact", "Name", "ChangeSet"]
+              RunOrder: 2
+              Region: !Ref AWS::Region
+
+        - Name: ValidateTemplates
+          Actions:
+            - Name: CfnNag
+              InputArtifacts:
+                - Name: Source
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: '1'
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref CfnNagBuildProject
+              OutputArtifacts:
+                - Name: CfnNagOutput
+              RunOrder: 1
+
+            - Name: CfnLint
+              InputArtifacts:
+                - Name: Source
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: '1'
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref CfnLintBuildProject
+              OutputArtifacts:
+                - Name: CfnLintOutput
+              RunOrder: 2
+
+        - Name: !Sub Stage-${AWS::Region}
+          Actions:
+            - !If
+              - DeletingStage
+              - Name: CreateUpdate
+                ActionTypeId:
+                  Category: Deploy
+                  Owner: AWS
+                  Provider: CloudFormation
+                  Version: '1'
+                Configuration:
+                  ActionMode: CREATE_UPDATE
+                  RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+                  StackName: !Sub ${AWS::StackName}-Stack-Stage-${AWS::Region}
+                  TemplatePath: !Sub Source::${TemplatePath}
+                  Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                  ParameterOverrides: !If [ HasStageParameters, !Ref StageParameters, !Ref "AWS::NoValue" ]
+                InputArtifacts:
+                  - Name: Source
+                RunOrder: 1
+                Region: !Ref AWS::Region
+              - Name: ExecuteChangeSet
+                ActionTypeId:
+                  Category: Deploy
+                  Owner: AWS
+                  Provider: CloudFormation
+                  Version: '1'
+                Configuration:
+                  ActionMode: CHANGE_SET_EXECUTE
+                  RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+                  StackName: !Sub ${AWS::StackName}-Stack-Stage-${AWS::Region}
+                  ChangeSetName: !FindInMap ["StageArtifact", "Name", "ChangeSet"]
+                OutputArtifacts:
+                  - Name: !Sub ${AWS::StackName}-ExecutedChangeSet-Stage-${AWS::Region}
+                RunOrder: 1
+                Region: !Ref AWS::Region
+
+            - Name: DriftDetection
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: '1'
+              Configuration:
+                FunctionName: !Ref DriftDetectionLambda
+              InputArtifacts:
+                - Name: Source
+              RunOrder: 2
+              Region: !Ref AWS::Region
+
+            - Name: ApproveChangeSet
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                NotificationArn: !Ref NotificationSnsTopic
+                CustomData: "Do you want to approve to deploy the changes to production stacks?"
+              RunOrder: 3
+              Region: !Ref AWS::Region
+
+            - !If
+              - DeletingStage
+              - Name: DeleteStageStack
+                ActionTypeId:
+                  Category: Deploy
+                  Owner: AWS
+                  Provider: CloudFormation
+                  Version: '1'
+                Configuration:
+                  ActionMode: DELETE_ONLY
+                  RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+                  StackName: !Sub ${AWS::StackName}-Stack-Stage-${AWS::Region}
+                RunOrder: 4
+                Region: !Ref AWS::Region
+              - !Ref AWS::NoValue
+
+            - Name: PutStageArtifact
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: '1'
+              Configuration:
+                FunctionName: !Ref StageArtifactSsmLambda
+              InputArtifacts:
+                - Name: Source
+              RunOrder: !If [ DeletingStage, 5, 4 ]
+              Region: !Ref AWS::Region
+
+        - Name: !Sub Secondary-${SecondaryRegion}
+          Actions:
+            - Name: CreateUpdate
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+                StackName: !Sub ${AWS::StackName}-Stack-Secondary-${SecondaryRegion}
+                TemplatePath: !Sub Source::${TemplatePath}
+                Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                ParameterOverrides: !If [ HasSecondaryParameters, !Ref SecondaryParameters, !Ref "AWS::NoValue" ]
+              InputArtifacts:
+                - Name: Source
+              RunOrder: 1
+              Region: !Ref SecondaryRegion
+
+        - Name: !Sub PrimaryProd-${AWS::Region}
+          Actions:
+            - Name: CreateUpdate
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+                StackName: !Sub ${AWS::StackName}-Stack-PrimaryProd-${AWS::Region}
+                TemplatePath: !Sub Source::${TemplatePath}
+                Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                ParameterOverrides: !If [ HasPrimaryParameters, !Ref PrimaryParameters, !Ref "AWS::NoValue" ]
+              InputArtifacts:
+                - Name: Source
+              RunOrder: 1
+              Region: !Ref AWS::Region
+
+  InfraPipelineWebhook:
+    Type: AWS::CodePipeline::Webhook
+    Condition: UseGitHub
+    Properties:
+      Authentication: GITHUB_HMAC
+      AuthenticationConfiguration:
+        SecretToken: !Sub '{{resolve:secretsmanager:${SolutionSecretName}:SecretString:github-access-token}}'
+      Filters:
+        - JsonPath: "$.ref"
+          MatchEquals: refs/heads/{Branch}
+      TargetPipeline: !Ref InfraGitHubPipeline
+      TargetAction: GitHub
+      Name: !Sub ${AWS::StackName}-AppPipelineWebhook
+      TargetPipelineVersion: !GetAtt InfraGitHubPipeline.Version
+      RegisterWithThirdParty: true
 
   CfnNagBuildProject:
     Type: AWS::CodeBuild::Project
@@ -1066,8 +1394,9 @@ Resources:
                 Resource:
                   - "*"
 
-  RollbackChangeLambda:
+  RollbackChangeGitHubLambda:
     Type: AWS::Lambda::Function
+    Condition: UseGitHub
     Properties:
       Description: Rolls back the changes of stage stack
       Handler: index.handler
@@ -1080,7 +1409,31 @@ Resources:
       Environment:
         Variables:
           STAGE_STACK_NAME: !Sub ${AWS::StackName}-Stack-Stage-${AWS::Region}
-          PIPELINE_NAME: !Ref InfraPipeline
+          PIPELINE_NAME: !Ref InfraGitHubPipeline
+          STAGE_NAME: !Sub Stage-${AWS::Region}
+          ACTION_NAME: ApproveChangeSet
+          ARTIFACT_SOURCE: !Join ["", ["/", !Ref "AWS::StackName", "/", !FindInMap ["StageArtifact", "Parameter", "Source"]]]
+          ARTIFACT_PARAMETER: !Join ["", ["/", !Ref "AWS::StackName", "/", !FindInMap ["StageArtifact", "Parameter", "Parameter"]]]
+          DELETE_STAGE_STACK: !Ref DeleteStageStack
+          TEMPLATE_PATH: !Ref TemplatePath
+
+
+  RollbackChangeCodeCommitLambda:
+    Type: AWS::Lambda::Function
+    Condition: UseCodeCommit
+    Properties:
+      Description: Rolls back the changes of stage stack
+      Handler: index.handler
+      Role: !GetAtt RollbackChangeLambdaRole.Arn
+      Code:
+        S3Bucket: !Join ["-", [!FindInMap ["SourceCode", "General", "S3Bucket"], Ref: "AWS::Region"]]
+        S3Key: !Join ["/", [!FindInMap ["SourceCode", "General", "KeyPrefix"],  "rollback-change.zip"]]
+      Runtime:  nodejs12.x
+      Timeout: 60
+      Environment:
+        Variables:
+          STAGE_STACK_NAME: !Sub ${AWS::StackName}-Stack-Stage-${AWS::Region}
+          PIPELINE_NAME: !Ref InfraCodeCommitPipeline
           STAGE_NAME: !Sub Stage-${AWS::Region}
           ACTION_NAME: ApproveChangeSet
           ARTIFACT_SOURCE: !Join ["", ["/", !Ref "AWS::StackName", "/", !FindInMap ["StageArtifact", "Parameter", "Source"]]]
@@ -1130,8 +1483,9 @@ Resources:
                 Resource:
                   - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}-Stack-Stage-${AWS::Region}/*
 
-  RejectCloudWatchRule:
+  RejectCloudWatchGitHubRule:
     Type: AWS::Events::Rule
+    Condition: UseGitHub
     Properties:
       Name: !Sub ${AWS::StackName}-Reject-Rule-${AWS::Region}
       Description: The rule to trigger rollback when the change is not approved
@@ -1151,16 +1505,51 @@ Resources:
         }
       State: ENABLED
       Targets:
-        - Arn: !GetAtt RollbackChangeLambda.Arn
+        - Arn: !GetAtt RollbackChangeGitHubLambda.Arn
           Id: !Sub ${AWS::StackName}-Reject-Lambda-${AWS::Region}
 
-  RejectCloudWatchRuleLambdaPermission:
-    Type: AWS::Lambda::Permission
+  RejectCloudWatchCodeCommitRule:
+    Type: AWS::Events::Rule
+    Condition: UseCodeCommit
     Properties:
-      FunctionName: !GetAtt RollbackChangeLambda.Arn
+      Name: !Sub ${AWS::StackName}-Reject-Rule-${AWS::Region}
+      Description: The rule to trigger rollback when the change is not approved
+      EventPattern: |
+        {
+          "source": [
+            "aws.codepipeline"
+          ],
+          "detail-type": [
+            "CodePipeline Action Execution State Change"
+          ],
+          "detail": {
+            "state": [
+              "FAILED"
+            ]
+          }
+        }
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt RollbackChangeCodeCommitLambda.Arn
+          Id: !Sub ${AWS::StackName}-Reject-Lambda-${AWS::Region}
+
+  RejectCloudWatchRuleLambdaGitHubPermission:
+    Type: AWS::Lambda::Permission
+    Condition: UseGitHub
+    Properties:
+      FunctionName: !GetAtt RollbackChangeGitHubLambda.Arn
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
-      SourceArn: !GetAtt RejectCloudWatchRule.Arn
+      SourceArn: !GetAtt RejectCloudWatchGitHubRule.Arn
+
+  RejectCloudWatchRuleLambdaCodeCommitPermission:
+    Type: AWS::Lambda::Permission
+    Condition: UseCodeCommit
+    Properties:
+      FunctionName: !GetAtt RollbackChangeCodeCommitLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RejectCloudWatchCodeCommitRule.Arn
 
   CustomResourceLambda:
     Type: AWS::Lambda::Function
